@@ -1,0 +1,222 @@
+import os
+import fitz  # PyMuPDF
+import faiss
+import torch
+import numpy as np
+import pickle
+import open_clip # Import open_clip
+from huggingface_hub import InferenceClient # Import Hugging Face Inference Client
+
+# --- 0. Setup ---
+# OpenCLIP will still run on your local device for embedding generation
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"Using device for OpenCLIP: {device}")
+
+# --- 1. PDF Text Extraction ---
+def extract_text_from_pdf(pdf_path):
+    doc = fitz.open(pdf_path)
+    text = "\n".join(page.get_text() for page in doc)
+    doc.close()
+    return text
+
+# --- 2. Split Text into Chunks ---
+def split_text(text, chunk_size=800, overlap=100):
+    words = text.split()
+    chunks = []
+    i = 0
+    while i < len(words):
+        chunk = " ".join(words[i:i + chunk_size])
+        chunks.append(chunk)
+        i += chunk_size - overlap
+    return chunks
+
+# --- 3. Load Models (Modified for Hugging Face Inference API) ---
+print("Loading embedding model (OpenCLIP) locally...")
+# OpenCLIP model and tokenizer remain local for embedding generation
+clip_model, _, clip_preprocess = open_clip.create_model_and_transforms('ViT-B-32', pretrained='laion2b_s34b_b79k', device=device)
+clip_tokenizer = open_clip.get_tokenizer('ViT-B-32')
+
+print("Initializing Hugging Face Inference Client for Mistral (no local LLM download)...")
+# For the LLM, we will use the Hugging Face Inference API
+HF_TOKEN = os.environ.get("HF_TOKEN") # Get your Hugging Face token from environment variable
+if not HF_TOKEN:
+    raise ValueError(
+        "HF_TOKEN environment variable not set. "
+        "Please set it before running the script (e.g., export HF_TOKEN='hf_YOUR_TOKEN')"
+    )
+
+# Model ID for Mistral-7B-Instruct-v0.2 on Hugging Face Hub
+# Ensure this model is actually available via the free Inference API or your paid endpoint.
+HF_MISTRAL_MODEL_ID = "mistralai/Mistral-7B-Instruct-v0.2"
+
+# Initialize the InferenceClient for text generation.
+# The `model` argument here specifies the model to use on the Hugging Face server.
+hf_inference_client = InferenceClient(HF_MISTRAL_MODEL_ID, token=HF_TOKEN)
+
+
+# --- 4. Build or Load Index ---
+def build_or_load_index(chunks, cache_path="faiss_index.pkl"):
+
+    print("Generating embeddings with OpenCLIP...")
+    embeddings = []
+    # Process chunks in batches for efficiency
+    batch_size = 64 # Adjust based on your GPU memory
+    for i in range(0, len(chunks), batch_size):
+        batch_chunks = chunks[i:i + batch_size]
+        if not batch_chunks: # Skip if batch is empty
+            continue
+        # Tokenize and encode text using OpenCLIP's text encoder
+        text_tokens = clip_tokenizer(batch_chunks).to(device)
+        with torch.no_grad():
+            batch_embeddings = clip_model.encode_text(text_tokens)
+        embeddings.append(batch_embeddings.cpu().numpy())
+
+    if not embeddings:
+        raise ValueError("No embeddings generated. Check PDF content or chunking.")
+
+    emb_matrix = np.vstack(embeddings).astype("float32")
+    # Normalize embeddings for cosine similarity (dot product in FAISS)
+    faiss.normalize_L2(emb_matrix)
+
+    index = faiss.IndexFlatIP(emb_matrix.shape[1])
+    index.add(emb_matrix)
+    with open(cache_path, "wb") as f:
+        pickle.dump((index, chunks), f)
+    print("FAISS index built and saved.")
+    # --- Index Checks after loading ---
+    print(f"  Index loaded - is_trained: {index.is_trained}")
+    print(f"  Index loaded - total vectors (ntotal): {index.ntotal}")
+    print(f"  Index loaded - vector dimension (d): {index.d}")
+    return index, chunks
+
+# --- 5. Query Index ---
+# --- 5. Query Index ---
+def query_index(question, index, chunks, k=5):
+    # --- Index Check before query ---
+    if index.ntotal == 0:
+        print("FAISS index is empty. Cannot perform search.")
+        return "" # Return empty context if index is empty
+    print(f"Querying FAISS index with {index.ntotal} vectors.")
+    # --- End Index Check ---
+
+    # Encode the question using OpenCLIP's text encoder
+    q_tokens = clip_tokenizer(question).to(device)
+    with torch.no_grad():
+        q_vec = clip_model.encode_text(q_tokens).cpu().numpy().astype("float32")
+    faiss.normalize_L2(q_vec) # Normalize query embedding too
+
+    # --- THE CRITICAL FIX IS HERE ---
+    # q_vec is already (1, 512), which is the correct 2D shape for FAISS search (1 query, 512 dimensions)
+    query_vector_for_faiss = q_vec # <--- CHANGE THIS LINE!
+
+    # --- Debugging (keep these lines for verification) ---
+    #print(f"DEBUG: Shape of q_vec after OpenCLIP encoding and normalization: {q_vec.shape}")
+    #print(f"DEBUG: Shape of query_vector_for_faiss *before* FAISS search: {query_vector_for_faiss.shape}")
+    #print(f"DEBUG: Type of query_vector_for_faiss: {type(query_vector_for_faiss)}")
+    #print(f"DEBUG: Requested k: {k}")
+    # --- End Debugging ---
+
+    try:
+        # Ensure k does not exceed the number of vectors in the index
+        actual_k = min(k, index.ntotal)
+        if actual_k <= 0: # Handle case where k becomes 0 or negative
+            print(f"Warning: effective k is {actual_k}, returning empty context.")
+            return ""
+
+        # This line will now receive a (1, 512) array, which FAISS expects.
+        search_result = index.search(query_vector_for_faiss, k=actual_k)
+
+        # --- Debugging (keep these lines for verification) ---
+        # print(f"DEBUG: Raw search_result from index.search(): {search_result}")
+        #print(f"DEBUG: Type of search_result: {type(search_result)}")
+        #print(f"DEBUG: Length of search_result: {len(search_result) if hasattr(search_result, '__len__') else 'N/A'}")
+        # --- End Debugging ---
+
+        D, I = search_result # This unpacking should now work correctly
+
+        # I[0] contains the indices for the first (and only) query
+        # Filter out invalid indices (e.g., -1 which FAISS can return if k > actual results found)
+        valid_indices = [i for i in I[0] if 0 <= i < len(chunks)]
+
+        if not valid_indices:
+            print("No valid context chunks found by FAISS search.")
+            return ""
+
+        return "\n".join(chunks[i] for i in valid_indices)
+    except Exception as e:
+        print(f"An error occurred during FAISS search: {e}")
+        import traceback
+        traceback.print_exc() # Print the full stack trace for this specific error
+        return "" # Return empty context to avoid crashing the chat loop
+
+
+
+# --- 6. Generate Answer (Corrected for Hugging Face Inference API - chat_completion task) ---
+def generate_answer(question, context, max_tokens=512): # max_tokens passed as default
+    # Prepare messages in the OpenAI-like chat format expected by hf_inference_client.chat_completion
+    messages = [
+        {"role": "system", "content": "You are a helpful assistant that answers questions concisely and accurately based on the provided context. If the answer is not in the context, state that you don't know."},
+        {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {question}"}
+    ]
+
+    try:
+        chat_completion = hf_inference_client.chat_completion(
+            messages=messages,
+            max_tokens=max_tokens, # <--- CHANGE THIS LINE: from max_new_tokens to max_tokens
+            temperature=0.7,
+            top_p=0.95,
+            # If you encounter further errors, try commenting out temperature and top_p
+            # as some basic endpoints might only support 'max_tokens' initially.
+        )
+
+        answer = chat_completion.choices[0].message.content.strip()
+
+        return answer
+
+    except Exception as e:
+        print(f"Error calling Hugging Face Inference API (chat_completion task): {e}")
+        return "I apologize, but I couldn't generate an answer due to an API error. Please check your token, API limits, or try again."
+
+# The rest of your code remains exactly the same.
+
+# --- 7. PDF Q&A Chat Loop ---
+def pdf_chat(pdf_path):
+    try:
+
+        print("Extracting text from PDF...")
+        text = extract_text_from_pdf(pdf_path)
+        chunks = split_text(text)
+
+        index_file = pdf_path + ".faiss.pkl"
+        index, chunk_list = build_or_load_index(chunks, index_file)
+
+        print("\nReady! Ask questions about your PDF (type 'exit' to quit):")
+        while True:
+            question = input("You: ")
+            if question.lower() in ("exit", "quit"):
+                break
+
+            print("Searching for relevant context...")
+            context = query_index(question, index, chunk_list, k=5)
+
+            if not context:
+                print("Bot: I couldn't find any relevant context for your question in the document. Please try rephrasing.")
+                continue
+
+            print("Generating answer...")
+            answer = generate_answer(question, context)
+            print(f"\nBot: {answer}\n")
+
+    except FileNotFoundError:
+        print(f"Error: File '{pdf_path}' not found.")
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
+
+# --- 8. Run ---
+if __name__ == "__main__":
+   # pdf_path = "/home/shopclues/ebooks/Database System Concepts-6e.pdf"
+    pdf_path = "/home/shopclues/ebooks/Mindset.pdf"
+    if not os.path.exists(pdf_path):
+        print(f"Warning: PDF file not found at '{pdf_path}'. Please update the path or ensure the file exists.")
+        # You might want to exit or prompt for a valid path here.
+    pdf_chat(pdf_path)
